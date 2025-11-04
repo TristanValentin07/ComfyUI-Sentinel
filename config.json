@@ -1,6 +1,6 @@
 {
     "secret_key_env": "SECRET_KEY",
-    "users_db": "users_db.json",
+    "users_db": "//yvshn002/_dsty_stco/AI_farm/credentials.txt",
     "access_token_expiration_hours": 12,
     "max_access_token_expiration_hours": 8760,
     "log": "sentinel.log",
@@ -10,6 +10,8 @@
     "blacklist_after_attempts": 0,
     "free_memory_on_logout": false,
     "force_https": false,
-    "seperate_users": false,
+    "seperate_users": true,
+    "user_loras_base": "//yvshn002/_dsty_stco/AI_farm/Lora",
+    "user_outputs_base": "//yvshn002/_dsty_stco/AI_farm/output",
     "manager_admin_only": false
 }

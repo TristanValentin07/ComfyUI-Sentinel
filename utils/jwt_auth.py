@@ -82,8 +82,10 @@ class JWTAuth:
                 request["user_id"] = user_id
                 request["user"] = username
 
-                set_fallback = request.path in ["/api/prompt"]
-                self.access_control.set_current_user_id(user_id, set_fallback)
+                
+                self.access_control.set_current_user_id(user_id)
+                self.access_control.set_current_username(username)
+                
 
             except jwt.ExpiredSignatureError:
                 return await handle_unauthorized_access(

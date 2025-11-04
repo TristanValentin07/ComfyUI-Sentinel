@@ -4,6 +4,8 @@ import copy
 import contextvars
 from aiohttp import web
 from typing import Optional
+import logging 
+from datetime import datetime
 
 import folder_paths
 from server import PromptServer
@@ -18,86 +20,141 @@ class AccessControl:
         self.server = server
 
         self._current_user = contextvars.ContextVar("user_id", default=None)
-        self.__current_user_id = None
+        self._current_username = contextvars.ContextVar("username", default=None)
+        
+        self.__current_user_id = None 
+        self.__current_username = None
 
         self.__get_output_directory = folder_paths.get_output_directory
         self.__get_temp_directory = folder_paths.get_temp_directory
-        self.__get_input_directory = folder_paths.get_input_directory
+        
+        self.__get_filename_list = folder_paths.get_filename_list
+        self.__get_full_path = folder_paths.get_full_path
 
         self.__prompt_queue = self.server.prompt_queue
-        self.__prompt_queue_put = self.__prompt_queue.put
+        self.__prompt_queue_put = self.server.prompt_queue.put
 
     @property
     def folder_paths(self) -> tuple:
         return (
             self.__get_output_directory(),
             self.__get_temp_directory(),
-            self.__get_input_directory(),
+            folder_paths.get_input_directory(), 
         )
 
-    def set_current_user_id(self, user_id: str, set_fallback: bool = False) -> None:
-        """Set the current user directory from ID."""
+    def set_current_user_id(self, user_id: str) -> None:
         self._current_user.set(user_id)
+        self.__current_user_id = user_id 
 
-        if set_fallback:
-            self.__current_user_id = user_id
+    def set_current_username(self, username: str) -> None:
+        self._current_username.set(username)
+        self.__current_username = username 
 
     def get_current_user_id(self) -> str:
-        """Retrieve the current user directory from ID."""
-        if self._current_user.get():
-            return self._current_user.get()
+        user_id = self._current_user.get()
+        if user_id:
+            return user_id
+        return self.__current_user_id 
 
-        return self.__current_user_id
+    def get_current_username(self) -> str:
+        username = self._current_username.get()
+        if username:
+            return username
+        return self.__current_username 
 
+    
     def get_user_output_directory(self) -> str:
-        """Get the user-specific output directory."""
-        return os.path.join(
-            self.__get_output_directory(),
-            self.get_current_user_id() or "public",
-        )
+        base_output_path = r"\\yvshn002\_dsty_stco\AI_farm\output"
+        username = self.get_current_username() 
+        
+        if not username:
+            return self.__get_output_directory()
+
+        try:
+            date_folder = datetime.now().strftime("%Y-%m-%d")
+            
+            full_day_path = os.path.join(base_output_path, username, "ComfyUI", date_folder)
+            
+            os.makedirs(full_day_path, exist_ok=True)
+            
+            return full_day_path
+        
+        except Exception as e:
+            print(f"[Sentinel] ERROR: Failed to create output directory: {e}")
+            return os.path.join(base_output_path, username)
 
     def get_user_temp_directory(self) -> str:
-        """Get the user-specific temp directory."""
-        return os.path.join(
-            self.__get_temp_directory(),
-            self.get_current_user_id() or "public",
-        )
+        base_temp_path = r"\\yvshn002\_dsty_stco\AI_farm\Lora_temp"
+        username = self.get_current_username()
+        if not username:
+            return self.__get_temp_directory()
+        return os.path.join(base_temp_path, username)
+        
+    def patched_get_filename_list(self, folder_name: str) -> list[str]:
+        if folder_name == "loras":
+            base_lora_path = r"\\yvshn002\_dsty_stco\AI_farm\Lora"
+            username = self.get_current_username() 
+            
+            all_found_files = set()
+            extensions = folder_paths.supported_pt_extensions
 
-    def get_user_input_directory(self) -> str:
-        """Get the user-specific input directory."""
-        input_directory = os.path.join(
-            self.__get_input_directory(),
-            self.get_current_user_id() or "public",
-        )
+            if username:
+                user_lora_path = os.path.join(base_lora_path, username)
+                if os.path.isdir(user_lora_path):
+                    print(f"[Sentinel] LORA LIST: Searching user path: {user_lora_path}")
+                    try:
+                        files, _ = folder_paths.recursive_search(user_lora_path)
+                        all_found_files.update(folder_paths.filter_files_extensions(files, extensions))
+                    except Exception as e:
+                        print(f"[Sentinel] LORA LIST: Error in user path: {e}")
 
-        os.makedirs(input_directory, exist_ok=True)
+            common_lora_path = os.path.join(base_lora_path, "common")
+            if os.path.isdir(common_lora_path):
+                print(f"[Sentinel] LORA LIST: Searching common path: {common_lora_path}")
+                try:
+                    files, _ = folder_paths.recursive_search(common_lora_path)
+                    all_found_files.update(folder_paths.filter_files_extensions(files, extensions))
+                except Exception as e:
+                    print(f"[Sentinel] LORA LIST: Error in common path: {e}")
+            
+            print(f"[Sentinel] LORA LIST: Adding default/local LORAs.")
+            all_found_files.update(self.__get_filename_list(folder_name)) 
 
-        return input_directory
+            return sorted(list(all_found_files))
+        
+        return self.__get_filename_list(folder_name)
+        
+    def patched_get_full_path(self, folder_name: str, filename: str) -> str | None:
+        if folder_name == "loras":
+            base_lora_path = r"\\yvshn002\_dsty_stco\AI_farm\Lora"
+            username = self.get_current_username()
 
-    def add_user_specific_folder_paths(self, json_data) -> None:
-        """Add user-specific folder paths to the prompt JSON data."""
-        user_id = self.get_current_user_id() or "public"
+            if username:
+                user_lora_file_path = os.path.join(base_lora_path, username, filename)
+                if os.path.isfile(user_lora_file_path):
+                    print(f"[Sentinel] LORA LOAD: Found user LORA at '{user_lora_file_path}'")
+                    return user_lora_file_path
 
-        if isinstance(json_data, dict):
-            for key, value in json_data.items():
-                if key == "filename_prefix":
-                    json_data[key] = f"{user_id}/{value}"
-                else:
-                    self.add_user_specific_folder_paths(value)
-        elif isinstance(json_data, list):
-            for item in json_data:
-                self.add_user_specific_folder_paths(item)
+            common_lora_file_path = os.path.join(base_lora_path, "common", filename)
+            if os.path.isfile(common_lora_file_path):
+                print(f"[Sentinel] LORA LOAD: Found common LORA at '{common_lora_file_path}'")
+                return common_lora_file_path
 
-        return json_data
+            print(f"[Sentinel] LORA LOAD: Not found in user/common. Trying default path...")
+            return self.__get_full_path(folder_name, filename)
+
+        return self.__get_full_path(folder_name, filename)
 
     def patch_folder_paths(self) -> None:
-        """Patch the folder_paths with user-specific methods."""
-        # folder_paths.get_output_directory = self.get_user_output_directory
+        """Applique les patchs."""
+        
+        folder_paths.get_output_directory = self.get_user_output_directory
         folder_paths.get_temp_directory = self.get_user_temp_directory
-        folder_paths.get_input_directory = self.get_user_input_directory
-
-        self.server.add_on_prompt_handler(self.add_user_specific_folder_paths)
-
+        
+        folder_paths.get_filename_list = self.patched_get_filename_list
+        folder_paths.get_full_path = self.patched_get_full_path
+        
+    
     def create_folder_access_control_middleware(
         self, folder_paths: tuple = ()
     ) -> web.middleware:
@@ -158,7 +215,8 @@ class AccessControl:
             self.__prompt_queue.currently_running[i] = copy.deepcopy(item)
             self.__prompt_queue.task_counter += 1
             self.server.queue_updated()
-            return (item["prompt"], i)
+            return (item["prompt"], i) 
+
 
     def user_queue_task_done(
         self, item_id, history_result, status: Optional["PromptQueue.ExecutionStatus"]
@@ -216,7 +274,7 @@ class AccessControl:
                         heapq.heapify(self.__prompt_queue.queue)
                     self.server.queue_updated()
                     return True
-        return False
+            return False
 
     def user_queue_get_history(self, prompt_id=None, max_items=None, offset=-1):
         """Get the user-specific queue history."""
@@ -230,7 +288,7 @@ class AccessControl:
                 out = {}
                 i = 0
                 if offset < 0 and max_items is not None:
-                    offset = len(self.__prompt_queue.history) - max_items
+                    offset = len(user_history) - max_items
                 for k in user_history:
                     if i >= offset:
                         out[k] = user_history[k]

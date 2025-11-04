@@ -22,85 +22,14 @@ jwt_auth = JWTAuth(
 )
 
 
-@routes.get("/register")
-async def get_register(request: web.Request) -> web.Response:
-    with open(os.path.join(HTML_DIR, "register.html"), "r") as f:
-        html_content = f.read()
-
-    if not users_db.load_users():
-        html_content = html_content.replace("{{ X-Admin-User }}", "true")
-    html_content = html_content.replace("{{ X-Admin-User }}", "false")
-
-    return web.Response(body=html_content, content_type="text/html")
-
-
-@routes.post("/register")
-async def post_register(request: web.Request) -> web.Response:
-    sanitized_data = request.get("_sanitized_data", {})
-    ip = get_ip(request)
-    new_user_username = sanitized_data.get("new_user_username")
-    new_user_password = sanitized_data.get("new_user_password")
-    username = sanitized_data.get("username")
-    password = sanitized_data.get("password")
-
-    username_valid, username_invalid_message = validate_username(new_user_username)
-    if not username_valid:
-        return web.json_response({"error": username_invalid_message}, status=400)
-
-    password_valid, password_invalid_message = validate_password(new_user_password)
-    if not password_valid:
-        return web.json_response({"error": password_invalid_message}, status=400)
-
-    admin_user = users_db.get_admin_user()
-    admin_user_id = None
-
-    if admin_user[0] and (not new_user_username or not new_user_password):
-        return web.json_response(
-            {"error": "Missing new user registration details"}, status=400
-        )
-
-    if admin_user[0]:
-        if not username or not password:
-            return web.json_response(
-                {"error": "Missing admin user authentication details"}, status=400
-            )
-
-        admin_user_id = admin_user[0]
-
-        if admin_user_id is not None:
-            if not (
-                users_db.get_user(username)[0] == admin_user_id
-                and users_db.check_username_password(username, password)
-            ):
-                logger.registration_attempt(
-                    ip, username, password, new_user_username, new_user_password
-                )
-                timeout.add_failed_attempt(ip)
-                return web.json_response(
-                    {"message": "Invalid username or password"}, status=403
-                )
-
-    if None not in users_db.get_user(new_user_username):
-        return web.json_response({"error": "Username already exists"}, status=400)
-
-    users_db.add_user(
-        str(uuid.uuid4()),
-        new_user_username,
-        new_user_password,
-        not bool(admin_user_id),
-    )
-
-    logger.registration_success(
-        ip, new_user_username, username if admin_user_id is not None else None
-    )
-    timeout.remove_failed_attempts(ip)
-    return web.json_response({"message": "User registered successfully"})
-
-
 @routes.get("/login")
 async def get_login(request: web.Request) -> web.Response:
-    if not users_db.load_users():
-        return web.HTTPFound("/register")
+    if not users_db.load_users():   
+        return web.json_response(
+                {"error": "Bloquage dans /login, la database s'est mal chargée"},
+                status=503
+            )
+
 
     token = jwt_auth.get_token_from_request(request)
     if token:
@@ -129,7 +58,6 @@ async def post_login(request: web.Request) -> web.Response:
             {
                 "message": "Login successful",
                 "jwt_token": token,
-                # "user_settings_id": next((key for key, value in instance.user_manager.users.items() if value == username), ""),
             }
         )
         secure_flag = request.headers.get("X-Forwarded-Proto", "http") == "https"
@@ -147,7 +75,11 @@ async def post_login(request: web.Request) -> web.Response:
 @routes.get("/generate_token")
 async def get_generate_token(request: web.Request) -> web.Response:
     if not users_db.load_users():
-        return web.HTTPFound("/register")
+        return web.json_response(
+                {"error": "Bloquage /generate_token, la database s'est mal chargée"},
+                status=503
+            )
+
 
     token = jwt_auth.get_token_from_request(request)
     if token:
@@ -270,12 +202,12 @@ app.middlewares.append(ip_filter.create_ip_filter_middleware())
 app.middlewares.append(sanitizer.create_sanitizer_middleware())
 app.middlewares.append(
     timeout.create_time_out_middleware(
-        limited=("/login", "/register", "/generate_token")
+        limited=("/login", "/generate_token")
     )
 )
 app.middlewares.append(
     jwt_auth.create_jwt_middleware(
-        public=("/login", "/logout", "/register", "/generate_token"),
+        public=("/login", "/logout", "/generate_token"),
         public_prefixes=("/sentinel"),
     )
 )
