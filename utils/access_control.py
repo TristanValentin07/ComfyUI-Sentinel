@@ -2,8 +2,11 @@ import os
 import heapq
 import copy
 import contextvars
+import json
 from aiohttp import web
 from typing import Optional
+import logging 
+from datetime import datetime
 
 import folder_paths
 from server import PromptServer
@@ -17,104 +20,222 @@ class AccessControl:
         self.users_db = users_db
         self.server = server
 
+        # --- CHARGEMENT DE LA CONFIGURATION ---
+        self.config = {}
+        utils_dir = os.path.dirname(os.path.abspath(__file__))
+        root_node_dir = os.path.dirname(utils_dir)
+        config_path = os.path.join(root_node_dir, "config.json")
+        
+        print(f"[Sentinel] INIT: Chemin calculé du config : {config_path}")
+        
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    self.config = json.load(f)
+                print(f"[Sentinel] SUCCESS: Config chargée.")
+            except Exception as e:
+                print(f"[Sentinel] CRITICAL ERROR: Le fichier existe mais est illisible: {e}")
+        else:
+            fallback_path = os.path.join(utils_dir, "config.json")
+            if os.path.exists(fallback_path):
+                try:
+                    with open(fallback_path, 'r', encoding='utf-8') as f:
+                        self.config = json.load(f)
+                    print(f"[Sentinel] SUCCESS: Config chargée (depuis utils).")
+                except:
+                    pass
+            
+            if not self.config:
+                print(f"[Sentinel] CRITICAL ERROR: Fichier config.json INTROUVABLE.")
+        # ----------------------------------------------
+
         self._current_user = contextvars.ContextVar("user_id", default=None)
-        self.__current_user_id = None
+        self._current_username = contextvars.ContextVar("username", default=None)
+        
+        self.__current_user_id = None 
+        self.__current_username = None
 
         self.__get_output_directory = folder_paths.get_output_directory
         self.__get_temp_directory = folder_paths.get_temp_directory
-        self.__get_input_directory = folder_paths.get_input_directory
+        
+        self.__get_filename_list = folder_paths.get_filename_list
+        self.__get_full_path = folder_paths.get_full_path
 
         self.__prompt_queue = self.server.prompt_queue
-        self.__prompt_queue_put = self.__prompt_queue.put
+        self.__prompt_queue_put = self.server.prompt_queue.put
 
     @property
     def folder_paths(self) -> tuple:
         return (
             self.__get_output_directory(),
             self.__get_temp_directory(),
-            self.__get_input_directory(),
+            folder_paths.get_input_directory(), 
         )
 
-    def set_current_user_id(self, user_id: str, set_fallback: bool = False) -> None:
-        """Set the current user directory from ID."""
+    def set_current_user_id(self, user_id: str) -> None:
         self._current_user.set(user_id)
+        self.__current_user_id = user_id 
 
-        if set_fallback:
-            self.__current_user_id = user_id
+    def set_current_username(self, username: str) -> None:
+        self._current_username.set(username)
+        self.__current_username = username 
 
     def get_current_user_id(self) -> str:
-        """Retrieve the current user directory from ID."""
-        if self._current_user.get():
-            return self._current_user.get()
+        user_id = self._current_user.get()
+        if user_id:
+            return user_id
+        return self.__current_user_id 
 
-        return self.__current_user_id
+    def get_current_username(self) -> str:
+        username = self._current_username.get()
+        if username:
+            return username
+        return self.__current_username 
 
+    
     def get_user_output_directory(self) -> str:
-        """Get the user-specific output directory."""
-        return os.path.join(
-            self.__get_output_directory(),
-            self.get_current_user_id() or "public",
-        )
+        base_output_path = self.config.get("user_outputs_base", "")
+        
+        # CORRECTION CRITIQUE : On normalise les slashs (transforme / en \ sur Windows)
+        if base_output_path:
+            base_output_path = os.path.normpath(base_output_path)
+
+        username = self.get_current_username() 
+        
+        if not username:
+            return self.__get_output_directory()
+        
+        if not base_output_path:
+             return os.path.join(self.__get_output_directory(), username)
+
+        try:
+            date_folder = datetime.now().strftime("%Y-%m-%d")
+            full_day_path = os.path.join(base_output_path, username, "ComfyUI", date_folder)
+            os.makedirs(full_day_path, exist_ok=True)
+            return full_day_path
+        
+        except Exception as e:
+            print(f"[Sentinel] ERROR: Failed to create output directory: {e}")
+            return os.path.join(base_output_path, username)
 
     def get_user_temp_directory(self) -> str:
-        """Get the user-specific temp directory."""
-        return os.path.join(
-            self.__get_temp_directory(),
-            self.get_current_user_id() or "public",
-        )
+        return self.__get_temp_directory()
+        
+    def patched_get_filename_list(self, folder_name: str) -> list[str]:
+        if folder_name not in ["loras", "checkpoints"]:
+             return self.__get_filename_list(folder_name)
 
-    def get_user_input_directory(self) -> str:
-        """Get the user-specific input directory."""
-        input_directory = os.path.join(
-            self.__get_input_directory(),
-            self.get_current_user_id() or "public",
-        )
+        all_found_files = set()
+        
+        if folder_name == "loras":
+            extensions = folder_paths.supported_pt_extensions
+        elif folder_name == "checkpoints":
+            extensions = folder_paths.supported_pt_extensions
+        else:
+            extensions = []
 
-        os.makedirs(input_directory, exist_ok=True)
+        # 1. Scan LOCAUX
+        local_dir = os.path.join(folder_paths.base_path, "models", folder_name)
+        if os.path.isdir(local_dir):
+            try:
+                files, _ = folder_paths.recursive_search(local_dir)
+                all_found_files.update(folder_paths.filter_files_extensions(files, extensions))
+            except Exception as e:
+                print(f"[Sentinel] LIST: Error in local path: {e}")
 
-        return input_directory
+        # 2. Scan RESEAU
+        username = self.get_current_username()
+        base_path = ""
+        
+        if folder_name == "loras":
+            base_path = self.config.get("user_loras_base", "")
+        elif folder_name == "checkpoints":
+            base_path = self.config.get("user_checkpoints_base", "")
+            
+        if not base_path:
+            return sorted(list(all_found_files))
+            
+        # CORRECTION : Normalisation ici aussi par sécurité
+        base_path = os.path.normpath(base_path)
 
-    def add_user_specific_folder_paths(self, json_data) -> None:
-        """Add user-specific folder paths to the prompt JSON data."""
-        user_id = self.get_current_user_id() or "public"
+        try:
+            # Dossier utilisateur
+            if username:
+                user_path = os.path.join(base_path, username)
+                if os.path.isdir(user_path):
+                    files, _ = folder_paths.recursive_search(user_path)
+                    user_files = folder_paths.filter_files_extensions(files, extensions)
+                    for f in user_files:
+                        all_found_files.add(os.path.join(username, f).replace("\\", "/"))
 
-        if isinstance(json_data, dict):
-            for key, value in json_data.items():
-                if key == "filename_prefix":
-                    json_data[key] = f"{user_id}/{value}"
-                else:
-                    self.add_user_specific_folder_paths(value)
-        elif isinstance(json_data, list):
-            for item in json_data:
-                self.add_user_specific_folder_paths(item)
+            # Dossier commun
+            common_path = os.path.join(base_path, "common")
+            if os.path.isdir(common_path):
+                files, _ = folder_paths.recursive_search(common_path)
+                common_files = folder_paths.filter_files_extensions(files, extensions)
+                for f in common_files:
+                    all_found_files.add(os.path.join("common", f).replace("\\", "/"))
+        
+        except Exception as e:
+            print(f"[Sentinel] LIST: Error scanning network paths: {e}")
 
-        return json_data
+        return sorted(list(all_found_files))
+        
+    def patched_get_full_path(self, folder_name: str, filename: str) -> str | None:
+        if folder_name == "loras":
+            base_lora_path = self.config.get("user_loras_base", "")
+            if base_lora_path:
+                # Normalisation du chemin de base
+                base_lora_path = os.path.normpath(base_lora_path)
+                
+                username = self.get_current_username()
+                filename = filename.replace("\\", "/")
+                
+                if username and filename.startswith(f"{username}/"):
+                    full_path = os.path.join(base_lora_path, filename)
+                    if os.path.isfile(full_path):
+                        print(f"[Sentinel] LORA LOAD: Found (User Prefix): {full_path}")
+                        return full_path
+
+                if filename.startswith("common/"):
+                    full_path = os.path.join(base_lora_path, filename)
+                    if os.path.isfile(full_path):
+                         print(f"[Sentinel] LORA LOAD: Found (Common Prefix): {full_path}")
+                         return full_path
+                
+                if username:
+                    user_path = os.path.join(base_lora_path, username, filename)
+                    if os.path.isfile(user_path):
+                        return user_path
+
+                common_path = os.path.join(base_lora_path, "common", filename)
+                if os.path.isfile(common_path):
+                    return common_path
+
+            return self.__get_full_path(folder_name, filename)
+
+        return self.__get_full_path(folder_name, filename)
 
     def patch_folder_paths(self) -> None:
-        """Patch the folder_paths with user-specific methods."""
-        # folder_paths.get_output_directory = self.get_user_output_directory
-        folder_paths.get_temp_directory = self.get_user_temp_directory
-        folder_paths.get_input_directory = self.get_user_input_directory
-
-        self.server.add_on_prompt_handler(self.add_user_specific_folder_paths)
-
+        folder_paths.get_filename_list = self.patched_get_filename_list
+        folder_paths.get_output_directory = self.get_user_output_directory
+        folder_paths.get_full_path = self.patched_get_full_path
+        self.patch_prompt_queue()
+        
+    
     def create_folder_access_control_middleware(
         self, folder_paths: tuple = ()
     ) -> web.middleware:
-        """Create middleware for folder access control."""
-
         folder_paths = folder_paths or self.folder_paths
 
         @web.middleware
         async def folder_access_control_middleware(
             request: web.Request, handler
         ) -> web.Response:
-            """Middleware to handle folder access control."""
             if not request.path.startswith(folder_paths):
                 return await handler(request)
 
             user_id = request.get("user_id")
-
             user_id, user = self.users_db.get_user(user_id)
 
             try:
@@ -141,12 +262,33 @@ class AccessControl:
         return folder_access_control_middleware
 
     def user_queue_put(self, item):
-        """Put an item in the user-specific queue."""
-        item = {"prompt": item, "user_id": self.get_current_user_id()}
-        self.__prompt_queue_put(item)
+        username = self.get_current_username()
+        user_id = self.get_current_user_id() 
+        print(f"Sauvegarde en cours")
+
+        if username: 
+            try:
+                prompt_json = item[2]
+                for node_id, node_data in prompt_json.items():
+                    class_type = node_data.get("class_type")
+                    inputs = node_data.get("inputs", {})
+
+                    if class_type.startswith("SaveImage") and "filename_prefix" in inputs:
+                        original_prefix = inputs.get("filename_prefix", "ComfyUI")
+                        final_prefix_name = original_prefix.replace("\\", "/").split('/')[-1]
+                        inputs["filename_prefix"] = final_prefix_name
+                        print(f"[Sentinel] EXEC: Filename prefix cleaned to: {final_prefix_name}")
+            
+            except Exception as e:
+                print(f"[Sentinel] ERROR patching workflow JSON: {e}")
+        else:
+            print("[Sentinel] EXEC: Pas de username dans le contexte.")
+
+        item_with_user = {"prompt": item, "user_id": user_id} 
+        self.__prompt_queue_put(item_with_user)
+
 
     def user_queue_get(self, timeout=None):
-        """Get an item from the user-specific queue."""
         user_queue = self.__prompt_queue.queue
         with self.__prompt_queue.not_empty:
             while len(user_queue) == 0:
@@ -158,12 +300,12 @@ class AccessControl:
             self.__prompt_queue.currently_running[i] = copy.deepcopy(item)
             self.__prompt_queue.task_counter += 1
             self.server.queue_updated()
-            return (item["prompt"], i)
+            return (item["prompt"], i) 
+
 
     def user_queue_task_done(
         self, item_id, history_result, status: Optional["PromptQueue.ExecutionStatus"]
     ):
-        """Mark a user-specific queue task as done."""
         with self.__prompt_queue.mutex:
             prompt = self.__prompt_queue.currently_running.pop(item_id)
             if len(self.__prompt_queue.history) > MAXIMUM_HISTORY_SIZE:
@@ -183,7 +325,6 @@ class AccessControl:
             self.server.queue_updated()
 
     def user_queue_get_current_queue(self):
-        """Get the current user-specific queue."""
         with self.__prompt_queue.mutex:
             out = []
             for x in self.__prompt_queue.currently_running.values():
@@ -191,7 +332,6 @@ class AccessControl:
             return (out, copy.deepcopy(self.__prompt_queue.queue))
 
     def user_queue_wipe_queue(self):
-        """Wipe the user-specific queue."""
         with self.__prompt_queue.mutex:
             self.__prompt_queue.queue = [
                 item
@@ -201,7 +341,6 @@ class AccessControl:
             self.server.queue_updated()
 
     def user_queue_delete_queue_item(self, function):
-        """Delete an item from the user-specific queue."""
         with self.__prompt_queue.mutex:
             for x in range(len(self.__prompt_queue.queue)):
                 if (
@@ -216,10 +355,9 @@ class AccessControl:
                         heapq.heapify(self.__prompt_queue.queue)
                     self.server.queue_updated()
                     return True
-        return False
+            return False
 
     def user_queue_get_history(self, prompt_id=None, max_items=None, offset=-1):
-        """Get the user-specific queue history."""
         with self.__prompt_queue.mutex:
             user_history = {
                 k: v
@@ -230,7 +368,7 @@ class AccessControl:
                 out = {}
                 i = 0
                 if offset < 0 and max_items is not None:
-                    offset = len(self.__prompt_queue.history) - max_items
+                    offset = len(user_history) - max_items
                 for k in user_history:
                     if i >= offset:
                         out[k] = user_history[k]
@@ -244,7 +382,6 @@ class AccessControl:
                 return {}
 
     def user_queue_wipe_history(self):
-        """Wipe the user-specific queue history."""
         with self.__prompt_queue.mutex:
             self.__prompt_queue.history = {
                 k: v
@@ -253,7 +390,6 @@ class AccessControl:
             }
 
     def patch_prompt_queue(self):
-        """Patch the prompt queue with user-specific methods."""
         self.__prompt_queue.put = self.user_queue_put
         self.__prompt_queue.get = self.user_queue_get
         self.__prompt_queue.task_done = self.user_queue_task_done
@@ -266,13 +402,10 @@ class AccessControl:
     def create_manager_access_control_middleware(
         self, manager_directory: str = "/extensions/comfyui-manager", manager_routes: tuple = ()
     ) -> web.middleware:
-        """Create middleware for manager access control."""
-
         @web.middleware
         async def manager_access_control_middleware(
             request: web.Request, handler
         ) -> web.Response:
-            """Middleware to handle manager access control."""
             user_id = request.get("user_id")
             
             if self.users_db.get_admin_user()[0] == user_id or (not request.path.startswith(manager_routes) and not request.path.lower().startswith(manager_directory)):
