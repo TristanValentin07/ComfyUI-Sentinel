@@ -3,6 +3,8 @@ import heapq
 import copy
 import contextvars
 import json
+import time
+import threading  # <--- 1. AJOUT IMPORT
 from aiohttp import web
 from typing import Optional
 import logging 
@@ -20,7 +22,12 @@ class AccessControl:
         self.users_db = users_db
         self.server = server
 
-        # --- CHARGEMENT DE LA CONFIGURATION ---
+        # gestion du cache
+        self._cache = {} 
+        self._cache_ttl = 60
+        self._cache_lock = threading.Lock()
+    
+
         self.config = {}
         utils_dir = os.path.dirname(os.path.abspath(__file__))
         root_node_dir = os.path.dirname(utils_dir)
@@ -47,7 +54,6 @@ class AccessControl:
             
             if not self.config:
                 print(f"[Sentinel] CRITICAL ERROR: Fichier config.json INTROUVABLE.")
-        # ----------------------------------------------
 
         self._current_user = contextvars.ContextVar("user_id", default=None)
         self._current_username = contextvars.ContextVar("username", default=None)
@@ -96,7 +102,6 @@ class AccessControl:
     def get_user_output_directory(self) -> str:
         base_output_path = self.config.get("user_outputs_base", "")
         
-        # CORRECTION CRITIQUE : On normalise les slashs (transforme / en \ sur Windows)
         if base_output_path:
             base_output_path = os.path.normpath(base_output_path)
 
@@ -125,67 +130,81 @@ class AccessControl:
         if folder_name not in ["loras", "checkpoints"]:
              return self.__get_filename_list(folder_name)
 
-        all_found_files = set()
-        
-        if folder_name == "loras":
-            extensions = folder_paths.supported_pt_extensions
-        elif folder_name == "checkpoints":
-            extensions = folder_paths.supported_pt_extensions
-        else:
-            extensions = []
+        # 3. UTILISATION DU VERROU
+        # On utilise le lock ici. Si quelqu'un est déjà en train de scanner ou lire le cache,
+        # les autres attendent à l'entrée de ce bloc 'with'.
+        with self._cache_lock:
+            cache_username = self.get_current_username() or "global"
+            cache_key = f"{cache_username}_{folder_name}"
+            current_time = time.time()
 
-        # 1. Scan LOCAUX
-        local_dir = os.path.join(folder_paths.base_path, "models", folder_name)
-        if os.path.isdir(local_dir):
-            try:
-                files, _ = folder_paths.recursive_search(local_dir)
-                all_found_files.update(folder_paths.filter_files_extensions(files, extensions))
-            except Exception as e:
-                print(f"[Sentinel] LIST: Error in local path: {e}")
+            # Vérification rapide (maintenant protégée)
+            if cache_key in self._cache:
+                last_scan_time, cached_files = self._cache[cache_key]
+                if current_time - last_scan_time < self._cache_ttl:
+                    return cached_files
 
-        # 2. Scan RESEAU
-        username = self.get_current_username()
-        base_path = ""
-        
-        if folder_name == "loras":
-            base_path = self.config.get("user_loras_base", "")
-        elif folder_name == "checkpoints":
-            base_path = self.config.get("user_checkpoints_base", "")
+            # Si on arrive ici, c'est qu'il faut scanner.
+            # Comme on est dans le "with lock", personne d'autre ne peut lancer un scan en même temps.
             
-        if not base_path:
-            return sorted(list(all_found_files))
+            all_found_files = set() 
             
-        # CORRECTION : Normalisation ici aussi par sécurité
-        base_path = os.path.normpath(base_path)
+            if folder_name == "loras":
+                extensions = folder_paths.supported_pt_extensions
+            elif folder_name == "checkpoints":
+                extensions = folder_paths.supported_pt_extensions
+            else:
+                extensions = []
 
-        try:
-            # Dossier utilisateur
-            if username:
-                user_path = os.path.join(base_path, username)
-                if os.path.isdir(user_path):
-                    files, _ = folder_paths.recursive_search(user_path)
-                    user_files = folder_paths.filter_files_extensions(files, extensions)
-                    for f in user_files:
-                        all_found_files.add(os.path.join(username, f).replace("\\", "/"))
+            # 1. Scan LOCAUX
+            local_dir = os.path.join(folder_paths.base_path, "models", folder_name)
+            if os.path.isdir(local_dir):
+                try:
+                    files, _ = folder_paths.recursive_search(local_dir)
+                    all_found_files.update(folder_paths.filter_files_extensions(files, extensions))
+                except Exception as e:
+                    print(f"[Sentinel] LIST: Error in local path: {e}")
 
-            # Dossier commun
-            common_path = os.path.join(base_path, "common")
-            if os.path.isdir(common_path):
-                files, _ = folder_paths.recursive_search(common_path)
-                common_files = folder_paths.filter_files_extensions(files, extensions)
-                for f in common_files:
-                    all_found_files.add(os.path.join("common", f).replace("\\", "/"))
-        
-        except Exception as e:
-            print(f"[Sentinel] LIST: Error scanning network paths: {e}")
+            # 2. Scan RESEAU
+            username = self.get_current_username()
+            base_path = ""
+            
+            if folder_name == "loras":
+                base_path = self.config.get("user_loras_base", "")
+            elif folder_name == "checkpoints":
+                base_path = self.config.get("user_checkpoints_base", "")
+                
+            if base_path:
+                base_path = os.path.normpath(base_path)
+                try:
+                    if username:
+                        user_path = os.path.join(base_path, username)
+                        if os.path.isdir(user_path):
+                            files, _ = folder_paths.recursive_search(user_path)
+                            user_files = folder_paths.filter_files_extensions(files, extensions)
+                            for f in user_files:
+                                all_found_files.add(os.path.join(username, f).replace("\\", "/"))
 
-        return sorted(list(all_found_files))
+                    common_path = os.path.join(base_path, "common")
+                    if os.path.isdir(common_path):
+                        files, _ = folder_paths.recursive_search(common_path)
+                        common_files = folder_paths.filter_files_extensions(files, extensions)
+                        for f in common_files:
+                            all_found_files.add(os.path.join("common", f).replace("\\", "/"))
+            
+                except Exception as e:
+                    print(f"[Sentinel] LIST: Error scanning network paths: {e}")
+
+            # Sauvegarde en cache (toujours protégé par le lock)
+            final_list = sorted(list(all_found_files))
+            self._cache[cache_key] = (current_time, final_list)
+
+            return final_list
         
     def patched_get_full_path(self, folder_name: str, filename: str) -> str | None:
         if folder_name == "loras":
             base_lora_path = self.config.get("user_loras_base", "")
             if base_lora_path:
-                # Normalisation du chemin de base
                 base_lora_path = os.path.normpath(base_lora_path)
                 
                 username = self.get_current_username()
