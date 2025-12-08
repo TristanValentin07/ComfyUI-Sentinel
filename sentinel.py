@@ -213,9 +213,15 @@ app.middlewares.append(
 )
 
 if SEPERATE_USERS:
+    # Add middleware to ensure user context is set before /prompt endpoint
+    # This must be added AFTER JWT middleware so it runs AFTER JWT middleware sets request["user_id"]
+    # (middlewares execute in reverse order, so last added = first executed)
+    app.middlewares.append(access_control.create_user_context_middleware())
     app.middlewares.append(access_control.create_folder_access_control_middleware())
+    app.middlewares.append(access_control.create_workflow_response_middleware())
 
     access_control.patch_folder_paths()
+    access_control.patch_save_image_nodes()  # Patch SaveImage nodes to use correct output directory
     access_control.patch_prompt_queue()
 
 if MANAGER_ADMIN_ONLY:
