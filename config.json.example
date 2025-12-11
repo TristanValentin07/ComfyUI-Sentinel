@@ -13,5 +13,7 @@
     "seperate_users": true,
     "user_loras_base": "path/to/Lora",
     "user_outputs_base": "path/to/output",
+    "comfyui_user_base": "path/to/output/[userid]/ComfyUI",
+    "comfyui_shared_base": "path/to/output/shared/ComfyUI",
     "manager_admin_only": false
 }

@@ -163,19 +163,36 @@ class AccessControl:
                             user_id = item_data.get("user_id")
                             if user_id:
                                 # Cache it in prompt_to_user for faster future lookups
-                                username = None
-                                try:
-                                    _, user = self.users_db.get_user(user_id=user_id)
-                                    if user and "username" in user:
-                                        username = user["username"]
-                                except:
-                                    pass
+                                username = item_data.get("username")  # Try to get from item first
+                                if not username:
+                                    try:
+                                        _, user = self.users_db.get_user(user_id=user_id)
+                                        if user and "username" in user:
+                                            username = user["username"]
+                                    except:
+                                        pass
                                 with self.__prompt_to_user_lock:
                                     self.__prompt_to_user[prompt_id] = {"user_id": user_id, "username": username}
                                 return user_id
+            
+            # If no prompt_id or not found in prompt_to_user, check currently_running as fallback
+            # This handles cases where SaveImage runs after execution completes
+            if self.__prompt_queue.currently_running:
+                for item_data in reversed(list(self.__prompt_queue.currently_running.values())):
+                    if isinstance(item_data, dict):
+                        user_id = item_data.get("user_id")
+                        if user_id:
+                            # Try to cache it if we can get prompt_id
+                            if "prompt" in item_data and isinstance(item_data["prompt"], (list, tuple)) and len(item_data["prompt"]) > 1:
+                                item_prompt_id = item_data["prompt"][1]
+                                username = item_data.get("username")
+                                with self.__prompt_to_user_lock:
+                                    self.__prompt_to_user[item_prompt_id] = {"user_id": user_id, "username": username}
+                            return user_id
                 
                 # If we're in worker thread but couldn't find user, return None
-                print(f"[Sentinel] WARNING: Could not find user_id for prompt_id {prompt_id} in worker thread")
+                if prompt_id:
+                    print(f"[Sentinel] WARNING: Could not find user_id for prompt_id {prompt_id} in worker thread")
                 return None
         except Exception as e:
             # Log error for debugging
@@ -196,62 +213,77 @@ class AccessControl:
         if username:
             return username
         
-        # If not in context, try to get from execution context (works in worker thread)
+        # Try to get prompt_id from execution context first (most accurate)
+        prompt_id = None
         try:
             from comfy_execution.utils import get_executing_context
             exec_context = get_executing_context()
             if exec_context and exec_context.prompt_id:
                 prompt_id = exec_context.prompt_id
-                # First try the prompt_to_user mapping (fastest and most reliable)
+                # Try the prompt_to_user mapping (should be set by patched_execute_async or worker thread)
                 with self.__prompt_to_user_lock:
                     user_info = self.__prompt_to_user.get(prompt_id)
                     if user_info and "username" in user_info:
                         return user_info["username"]
-                
-                # Fallback: Look up user info from currently_running using prompt_id
+        except Exception:
+            pass  # Execution context not available, continue to fallback
+        
+        # CRITICAL: In worker thread, check currently_running as fallback
+        # This handles cases where execution context is not set yet or SaveImage runs after execution
+        try:
+            if prompt_id:
+                # If we have prompt_id, look for the specific item
                 for item_data in self.__prompt_queue.currently_running.values():
                     if isinstance(item_data, dict) and "prompt" in item_data:
-                        if item_data["prompt"][1] == prompt_id:  # prompt_id is at index 1
-                            # Try to get username from user_id
-                            user_id = item_data.get("user_id")
+                        if item_data["prompt"][1] == prompt_id:  # Match by prompt_id
                             stored_username = item_data.get("username")
-                            
                             if stored_username:
-                                # Cache it in prompt_to_user for faster future lookups
+                                # Cache it
                                 with self.__prompt_to_user_lock:
-                                    self.__prompt_to_user[prompt_id] = {"user_id": user_id, "username": stored_username}
+                                    self.__prompt_to_user[prompt_id] = {
+                                        "user_id": item_data.get("user_id"),
+                                        "username": stored_username
+                                    }
                                 return stored_username
                             
+                            # If no username but we have user_id, try to get from users_db
+                            user_id = item_data.get("user_id")
                             if user_id:
-                                # Get username from users_db (must use keyword argument)
-                                _, user = self.users_db.get_user(user_id=user_id)
-                                if user and "username" in user:
-                                    username = user["username"]
-                                    # Cache it in prompt_to_user for faster future lookups
-                                    with self.__prompt_to_user_lock:
-                                        self.__prompt_to_user[prompt_id] = {"user_id": user_id, "username": username}
-                                    return username
-                
-                # If we're in worker thread but couldn't find user, log warning and return None
-                print(f"[Sentinel] WARNING: Could not find user for prompt_id {prompt_id} in worker thread")
-                return None
-        except Exception as e:
-            # Log error for debugging
-            print(f"[Sentinel] ERROR in get_current_username: {e}")
-        
-        # For request handler thread or MainThread: try to get from currently_running as fallback
-        # This handles cases where save_images is called from callbacks after execution
-        try:
-            # Get the most recent running prompt (if any)
+                                try:
+                                    _, user = self.users_db.get_user(user_id=user_id)
+                                    if user and "username" in user:
+                                        username = user["username"]
+                                        # Cache it
+                                        with self.__prompt_to_user_lock:
+                                            self.__prompt_to_user[prompt_id] = {"user_id": user_id, "username": username}
+                                        return username
+                                except Exception:
+                                    pass
+            
+            # If no prompt_id or not found, get the most recent item (fallback)
+            # This handles cases where SaveImage is called from callbacks after execution completes
             if self.__prompt_queue.currently_running:
-                # Try to get username from the most recently added item
-                for item_data in self.__prompt_queue.currently_running.values():
+                # Iterate in reverse order to get the most recent item first
+                for item_data in reversed(list(self.__prompt_queue.currently_running.values())):
                     if isinstance(item_data, dict):
                         stored_username = item_data.get("username")
                         if stored_username:
+                            # Try to cache it if we can get prompt_id
+                            if "prompt" in item_data and isinstance(item_data["prompt"], (list, tuple)) and len(item_data["prompt"]) > 1:
+                                item_prompt_id = item_data["prompt"][1]
+                                with self.__prompt_to_user_lock:
+                                    self.__prompt_to_user[item_prompt_id] = {
+                                        "user_id": item_data.get("user_id"),
+                                        "username": stored_username
+                                    }
                             return stored_username
-        except Exception:
-            pass  # Silently fail
+        except Exception as e:
+            # Log error for debugging (only first few times)
+            if not hasattr(self, '_username_error_logged'):
+                self._username_error_logged = 0
+            if self._username_error_logged < 3:
+                print(f"[Sentinel] ERROR checking currently_running in get_current_username: {e}")
+                self._username_error_logged += 1
         
         # If we can't determine the user, return None to avoid privacy leaks
         return None 
@@ -673,10 +705,26 @@ class AccessControl:
     def patched_save_images(self, original_save_images):
         """Wrapper for SaveImage.save_images to get output directory dynamically."""
         def save_images(self, images, filename_prefix="ComfyUI", prompt=None, extra_pnginfo=None):
-            # Update output_dir dynamically based on current user context
-            # folder_paths.get_output_directory() is already patched to return user-specific directory
-            self.output_dir = folder_paths.get_output_directory()
+            # CRITICAL: Always update output_dir dynamically based on current user context
+            # This is essential because node instances are cached by node ID and shared across users
+            # When User B loads User A's workflow, they share the same cached node instance
+            # which still has self.output_dir pointing to User A's directory
+            old_output_dir = getattr(self, 'output_dir', None)
+            
+            # ALWAYS get the current user's output directory - don't rely on cached value
+            current_output_dir = folder_paths.get_output_directory()
+            self.output_dir = current_output_dir
+            
+            # Debug logging (only first few times to avoid spam)
+            if not hasattr(self, '_save_images_log_count'):
+                self._save_images_log_count = 0
+            self._save_images_log_count += 1
+            if self._save_images_log_count <= 3 or old_output_dir != current_output_dir:
+                username = self.get_current_username() or "unknown"
+                print(f"[Sentinel] DEBUG: SaveImage.save_images - user={username}, updated output_dir from '{old_output_dir}' to '{current_output_dir}'")
+            
             # Call the original save_images method
+            # The original method uses self.output_dir, which we just updated
             return original_save_images(self, images, filename_prefix, prompt, extra_pnginfo)
         return save_images
     
@@ -908,18 +956,44 @@ class AccessControl:
         try:
             import nodes
             if hasattr(nodes, 'SaveImage'):
+                # CRITICAL: Patch __init__ to ensure output_dir is always set dynamically
+                # This prevents cached node instances from using stale user directories
+                if not hasattr(nodes.SaveImage, '_original_init'):
+                    nodes.SaveImage._original_init = nodes.SaveImage.__init__
+                
+                def patched_save_image_init(self):
+                    # Call original __init__ first
+                    nodes.SaveImage._original_init(self)
+                    # Then update output_dir dynamically based on current user context
+                    # This ensures even cached instances get the correct directory
+                    self.output_dir = folder_paths.get_output_directory()
+                
+                nodes.SaveImage.__init__ = patched_save_image_init
+                
                 # Store original method
                 if not hasattr(nodes.SaveImage, '_original_save_images'):
                     nodes.SaveImage._original_save_images = nodes.SaveImage.save_images
-                # Patch with dynamic output directory
+                # Patch with dynamic output directory (double-check in save_images too)
                 nodes.SaveImage.save_images = self.patched_save_images(nodes.SaveImage._original_save_images)
             
             # Patch PreviewImage to get temp directory dynamically (same approach as SaveImage)
             if hasattr(nodes, 'PreviewImage'):
+                # CRITICAL: Patch __init__ to ensure output_dir is always set dynamically
+                if not hasattr(nodes.PreviewImage, '_original_init'):
+                    nodes.PreviewImage._original_init = nodes.PreviewImage.__init__
+                
+                def patched_preview_image_init(self):
+                    # Call original __init__ first
+                    nodes.PreviewImage._original_init(self)
+                    # Then update output_dir dynamically based on current user context
+                    self.output_dir = folder_paths.get_temp_directory()
+                
+                nodes.PreviewImage.__init__ = patched_preview_image_init
+                
                 # Store original method
                 if not hasattr(nodes.PreviewImage, '_original_save_images'):
                     nodes.PreviewImage._original_save_images = nodes.PreviewImage.save_images
-                # Patch with dynamic temp directory
+                # Patch with dynamic temp directory (double-check in save_images too)
                 def patched_preview_save_images(original_save_images):
                     def save_images(self, images, filename_prefix="ComfyUI", prompt=None, extra_pnginfo=None):
                         # Update output_dir dynamically based on current user context
@@ -930,6 +1004,8 @@ class AccessControl:
                 nodes.PreviewImage.save_images = patched_preview_save_images(nodes.PreviewImage._original_save_images)
         except Exception as e:
             print(f"[Sentinel] WARNING: Could not patch SaveImage/PreviewImage: {e}")
+            import traceback
+            traceback.print_exc()
         
         # Note: LoadImage and LoadImageMask don't need patching for user isolation
         # because folder_paths.get_input_directory() already returns user-specific directory.
@@ -1017,6 +1093,30 @@ class AccessControl:
 
 
     def user_queue_get(self, timeout=None):
+        # Try to patch prompt_worker lazily if not already patched
+        # This avoids circular import issues during Sentinel initialization
+        if not getattr(self, '_prompt_worker_patched', False):
+            try:
+                import sys
+                if 'main' in sys.modules:
+                    main = sys.modules['main']
+                    if hasattr(main, 'prompt_worker') and not hasattr(main, '_original_prompt_worker'):
+                        # Ensure lock exists
+                        if not hasattr(self, '_prompt_worker_patch_lock'):
+                            self._prompt_worker_patch_lock = threading.Lock()
+                        
+                        with self._prompt_worker_patch_lock:
+                            # Double-check after acquiring lock
+                            if not getattr(self, '_prompt_worker_patched', False) and hasattr(main, 'prompt_worker') and not hasattr(main, '_original_prompt_worker'):
+                                main._original_prompt_worker = main.prompt_worker
+                                patched_worker = self.patched_prompt_worker(main._original_prompt_worker, self)
+                                main.prompt_worker = patched_worker
+                                self._prompt_worker_patched = True
+                                print("[Sentinel] SUCCESS: Lazy-patched prompt_worker to ensure task_done is always called")
+            except Exception:
+                # Silently fail - we'll try again next time
+                pass
+        
         user_queue = self.__prompt_queue.queue
         with self.__prompt_queue.not_empty:
             while len(user_queue) == 0:
@@ -1030,6 +1130,9 @@ class AccessControl:
                 item_data = item.data
             else:
                 item_data = item
+            # Add timestamp to track how long item has been running
+            import time
+            item_data["_start_time"] = time.time()
             self.__prompt_queue.currently_running[i] = copy.deepcopy(item_data)
             self.__prompt_queue.task_counter += 1
             self.server.queue_updated()
@@ -1039,38 +1142,68 @@ class AccessControl:
     def user_queue_task_done(
         self, item_id, history_result, status: Optional["PromptQueue.ExecutionStatus"], process_item=None
     ):
-        with self.__prompt_queue.mutex:
-            prompt = self.__prompt_queue.currently_running.pop(item_id)
-            if len(self.__prompt_queue.history) > MAXIMUM_HISTORY_SIZE:
-                self.__prompt_queue.history.pop(next(iter(self.__prompt_queue.history)))
+        item_removed = False
+        try:
+            with self.__prompt_queue.mutex:
+                # CRITICAL: Use pop with default to avoid KeyError if item_id doesn't exist
+                # This can happen if task_done is called twice or item was already removed
+                prompt = self.__prompt_queue.currently_running.pop(item_id, None)
+                if prompt is None:
+                    print(f"[Sentinel] WARNING: task_done called for item_id {item_id} but item not found in currently_running")
+                    # Still update queue status to ensure UI is notified
+                    self.server.queue_updated()
+                    return
+                
+                item_removed = True  # Mark that we successfully removed the item
+                
+                if len(self.__prompt_queue.history) > MAXIMUM_HISTORY_SIZE:
+                    self.__prompt_queue.history.pop(next(iter(self.__prompt_queue.history)))
 
-            status_dict: Optional[dict] = None
-            if status is not None:
-                status_dict = copy.deepcopy(status._asdict())
+                status_dict: Optional[dict] = None
+                if status is not None:
+                    status_dict = copy.deepcopy(status._asdict())
 
-            # Extract the tuple from the dict structure
-            prompt_tuple = prompt["prompt"] if isinstance(prompt, dict) and "prompt" in prompt else prompt
-            
-            # Apply process_item if provided (it expects and returns a tuple)
-            if process_item is not None:
-                prompt_tuple = process_item(prompt_tuple)
-            
-            # Get user_id if available
-            user_id = prompt.get("user_id") if isinstance(prompt, dict) else None
-            
-            self.__prompt_queue.history[prompt_tuple[1]] = {
-                "prompt": prompt_tuple,
-                "outputs": {},
-                "status": status_dict,
-                "user_id": user_id,
-            }
-            self.__prompt_queue.history[prompt_tuple[1]].update(history_result)
-            
-            # DON'T clean up prompt_to_user mapping here - save_images might be called asynchronously
-            # or get_user_output_directory might be called from UI callbacks after execution completes
-            # Keep the mapping - it will be cleaned up when a new prompt starts or after a delay
-            
-            self.server.queue_updated()
+                # Extract the tuple from the dict structure
+                prompt_tuple = prompt["prompt"] if isinstance(prompt, dict) and "prompt" in prompt else prompt
+                
+                # Apply process_item if provided (it expects and returns a tuple)
+                if process_item is not None:
+                    prompt_tuple = process_item(prompt_tuple)
+                
+                # Get user_id if available
+                user_id = prompt.get("user_id") if isinstance(prompt, dict) else None
+                
+                prompt_id = prompt_tuple[1] if len(prompt_tuple) > 1 else "unknown"
+                
+                self.__prompt_queue.history[prompt_tuple[1]] = {
+                    "prompt": prompt_tuple,
+                    "outputs": {},
+                    "status": status_dict,
+                    "user_id": user_id,
+                }
+                self.__prompt_queue.history[prompt_tuple[1]].update(history_result)
+                
+                # DON'T clean up prompt_to_user mapping here - save_images might be called asynchronously
+                # or get_user_output_directory might be called from UI callbacks after execution completes
+                # Keep the mapping - it will be cleaned up when a new prompt starts or after a delay
+                
+                self.server.queue_updated()
+                print(f"[Sentinel] DEBUG: task_done completed for prompt_id={prompt_id}, item_id={item_id}")
+        except Exception as e:
+            # CRITICAL: Always remove item from currently_running even if there's an error
+            # This prevents items from getting stuck
+            print(f"[Sentinel] ERROR in user_queue_task_done for item_id {item_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            if not item_removed:
+                # Only try to remove if we didn't already remove it
+                try:
+                    with self.__prompt_queue.mutex:
+                        self.__prompt_queue.currently_running.pop(item_id, None)
+                        self.server.queue_updated()
+                        print(f"[Sentinel] DEBUG: Removed stuck item_id {item_id} after error")
+                except Exception as e2:
+                    print(f"[Sentinel] CRITICAL: Failed to remove item_id {item_id} even in error handler: {e2}")
 
     def user_queue_get_current_queue(self):
         with self.__prompt_queue.mutex:
@@ -1173,6 +1306,94 @@ class AccessControl:
                 if v["user_id"] != self.get_current_user_id()
             }
 
+    def delete_running_item_by_prompt_id(self, prompt_id):
+        """
+        Remove a stuck item from currently_running by prompt_id.
+        This is a recovery mechanism for when items get stuck due to exceptions.
+        Returns True if an item was removed, False otherwise.
+        """
+        with self.__prompt_queue.mutex:
+            for item_id, item in list(self.__prompt_queue.currently_running.items()):
+                # item structure: dict with "prompt" key containing tuple (number, prompt_id, ...)
+                if isinstance(item, dict) and "prompt" in item:
+                    item_prompt_id = item["prompt"][1] if len(item["prompt"]) > 1 else None
+                elif isinstance(item, (list, tuple)) and len(item) > 1:
+                    item_prompt_id = item[1]
+                else:
+                    continue
+                    
+                if item_prompt_id == prompt_id:
+                    self.__prompt_queue.currently_running.pop(item_id)
+                    self.server.queue_updated()
+                    print(f"[Sentinel] Removed stuck item from queue (prompt_id: {prompt_id}, item_id: {item_id})")
+                    return True
+            return False
+
+    def delete_running_items_by_user(self, user_identifier):
+        """
+        Remove stuck items from currently_running for a specific user.
+        user_identifier can be a user_id or username.
+        Returns the number of items removed.
+        """
+        removed_count = 0
+        with self.__prompt_queue.mutex:
+            for item_id, item in list(self.__prompt_queue.currently_running.items()):
+                # item structure: dict with "prompt", "user_id", "username" keys
+                if isinstance(item, dict):
+                    item_user_id = item.get("user_id")
+                    item_username = item.get("username")
+                    
+                    # Match if any of the identifiers match
+                    if (item_user_id == user_identifier or item_username == user_identifier):
+                        self.__prompt_queue.currently_running.pop(item_id)
+                        removed_count += 1
+                        prompt_id = item["prompt"][1] if "prompt" in item and len(item["prompt"]) > 1 else "unknown"
+                        print(f"[Sentinel] Removed stuck item from queue (user: {user_identifier}, prompt_id: {prompt_id}, item_id: {item_id})")
+            if removed_count > 0:
+                self.server.queue_updated()
+        return removed_count
+
+    def emergency_clear_all_running(self):
+        """
+        EMERGENCY: Clear ALL items from currently_running.
+        Use only when queue is completely blocked.
+        Returns the number of items cleared.
+        """
+        with self.__prompt_queue.mutex:
+            cleared_count = len(self.__prompt_queue.currently_running)
+            self.__prompt_queue.currently_running.clear()
+            self.server.queue_updated()
+            print(f"[Sentinel] EMERGENCY CLEAR: Removed {cleared_count} item(s) from currently_running")
+            return cleared_count
+
+    def get_stuck_items(self, user_identifier=None):
+        """
+        Get list of items that are stuck in currently_running.
+        If user_identifier is provided, only return items for that user.
+        Returns a list of dictionaries with item information.
+        """
+        stuck_items = []
+        with self.__prompt_queue.mutex:
+            for item_id, item in self.__prompt_queue.currently_running.items():
+                # item structure: dict with "prompt", "user_id", "username" keys
+                if isinstance(item, dict) and "prompt" in item:
+                    prompt_id = item["prompt"][1] if len(item["prompt"]) > 1 else None
+                    user_id = item.get("user_id")
+                    username = item.get("username")
+                    
+                    # If user_identifier is provided, filter by user
+                    if user_identifier:
+                        if not (user_id == user_identifier or username == user_identifier):
+                            continue
+                    
+                    stuck_items.append({
+                        "item_id": item_id,
+                        "prompt_id": prompt_id,
+                        "user_id": user_id,
+                        "username": username,
+                    })
+        return stuck_items
+
     def patched_execute_async(self, original_execute_async, access_control_instance):
         """Wrapper for PromptExecutor.execute_async to set user context before execution."""
         async def execute_async(executor_self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
@@ -1245,17 +1466,197 @@ class AccessControl:
         
         return execute_async
     
+    def patched_prompt_worker(self, original_prompt_worker, access_control_instance):
+        """Wrapper for prompt_worker to ensure task_done is always called, even on exceptions."""
+        def prompt_worker(q, server_instance):
+            import time
+            import gc
+            import traceback
+            import execution
+            import comfy.model_management
+            from comfy.cli_args import args
+            try:
+                import hook_breaker_ac10a0
+            except ImportError:
+                hook_breaker_ac10a0 = None
+            
+            current_time: float = 0.0
+            cache_type = execution.CacheType.CLASSIC
+            if args.cache_lru > 0:
+                cache_type = execution.CacheType.LRU
+            elif args.cache_ram > 0:
+                cache_type = execution.CacheType.RAM_PRESSURE
+            elif args.cache_none:
+                cache_type = execution.CacheType.NONE
+
+            e = execution.PromptExecutor(server_instance, cache_type=cache_type, cache_args={ "lru" : args.cache_lru, "ram" : args.cache_ram } )
+            last_gc_collect = 0
+            need_gc = False
+            gc_collect_interval = 10.0
+
+            while True:
+                timeout = 1000.0
+                if need_gc:
+                    timeout = max(gc_collect_interval - (current_time - last_gc_collect), 0.0)
+
+                queue_item = q.get(timeout=timeout)
+                if queue_item is not None:
+                    item, item_id = queue_item
+                    execution_start_time = time.perf_counter()
+                    prompt_id = item[1]
+                    server_instance.last_prompt_id = prompt_id
+
+                    sensitive = item[5]
+                    extra_data = item[3].copy()
+                    for k in sensitive:
+                        extra_data[k] = sensitive[k]
+                    
+                    # CRITICAL: Set user context BEFORE execution starts
+                    # Extract user info from extra_data (set in user_queue_put)
+                    user_id = extra_data.get("user_id")
+                    username = extra_data.get("username")
+                    
+                    # Store in prompt_to_user mapping for get_current_username() to find
+                    if user_id or username:
+                        with access_control_instance.__prompt_to_user_lock:
+                            access_control_instance.__prompt_to_user[prompt_id] = {
+                                "user_id": user_id,
+                                "username": username
+                            }
+                        print(f"[Sentinel] DEBUG: Set user context in worker thread - prompt_id={prompt_id}, user_id={user_id}, username={username}")
+
+                    # Wrap execute in try-except-finally to ensure task_done is always called
+                    # This prevents items from getting stuck in currently_running when exceptions occur
+                    try:
+                        e.execute(item[2], prompt_id, extra_data, item[4])
+                        need_gc = True
+                    except Exception as ex:
+                        # Log the exception but ensure we still call task_done
+                        print(f"[Sentinel] ERROR: Exception during prompt execution for prompt_id {prompt_id}: {ex}")
+                        traceback.print_exc()
+                        e.success = False
+                        e.history_result = {"outputs": {}, "meta": {}}
+                        e.status_messages = []
+                        need_gc = True
+                    finally:
+                        # Always call task_done to remove item from currently_running
+                        # This prevents the UI from showing infinite queue
+                        remove_sensitive = lambda prompt: prompt[:5] + prompt[6:]
+                        q.task_done(item_id,
+                                    e.history_result,
+                                    status=execution.PromptQueue.ExecutionStatus(
+                                        status_str='success' if e.success else 'error',
+                                        completed=e.success,
+                                        messages=e.status_messages), process_item=remove_sensitive)
+                        
+                        # CRITICAL: Send executing message with node=None to clear executing state
+                        # This must be sent AFTER task_done to ensure queue status is updated first
+                        # Note: task_done already calls queue_updated(), but we send executing message
+                        # to explicitly clear the executing state in the UI
+                        if server_instance.client_id is not None:
+                            server_instance.send_sync("executing", {"node": None, "prompt_id": prompt_id}, server_instance.client_id)
+                        
+                        # Debug logging to help diagnose stuck queue issues
+                        remaining = q.get_tasks_remaining()
+                        running_count = len(q.currently_running) if hasattr(q, 'currently_running') else 0
+                        queue_count = len(q.queue) if hasattr(q, 'queue') else 0
+                        print(f"[Sentinel] DEBUG: After task_done - queue_remaining={remaining}, running={running_count}, queued={queue_count}, prompt_id={prompt_id}, success={e.success}")
+
+                    current_time = time.perf_counter()
+                    execution_time = current_time - execution_start_time
+
+                    # Log Time in a more readable way after 10 minutes
+                    if execution_time > 600:
+                        execution_time = time.strftime("%H:%M:%S", time.gmtime(execution_time))
+                        logging.info(f"Prompt executed in {execution_time}")
+                    else:
+                        logging.info("Prompt executed in {:.2f} seconds".format(execution_time))
+
+                flags = q.get_flags()
+                free_memory = flags.get("free_memory", False)
+
+                if flags.get("unload_models", free_memory):
+                    comfy.model_management.unload_all_models()
+                    need_gc = True
+                    last_gc_collect = 0
+
+                if free_memory:
+                    e.reset()
+                    need_gc = True
+                    last_gc_collect = 0
+
+                if need_gc:
+                    current_time = time.perf_counter()
+                    if (current_time - last_gc_collect) > gc_collect_interval:
+                        gc.collect()
+                        comfy.model_management.soft_empty_cache()
+                        last_gc_collect = current_time
+                        need_gc = False
+                        if hook_breaker_ac10a0:
+                            hook_breaker_ac10a0.restore_functions()
+        
+        return prompt_worker
+
+    def user_queue_get_tasks_remaining(self):
+        """Get number of tasks remaining, accounting for Sentinel's wrapped queue items."""
+        with self.__prompt_queue.mutex:
+            # Count items in queue (may be wrapped in ComparableQueueItem)
+            queue_count = len(self.__prompt_queue.queue)
+            # Count items in currently_running (may be dicts with "prompt" key)
+            running_count = len(self.__prompt_queue.currently_running)
+            
+            # Auto-cleanup: Remove any items that have been running for more than 5 minutes
+            # This prevents stuck items from blocking the queue indefinitely
+            # Reduced from 1 hour to 5 minutes for faster recovery
+            import time
+            current_time = time.time()
+            cleaned_count = 0
+            for item_id, item in list(self.__prompt_queue.currently_running.items()):
+                # Check if item has a timestamp (we'll add this in user_queue_get)
+                if isinstance(item, dict) and "_start_time" in item:
+                    elapsed = current_time - item["_start_time"]
+                    if elapsed > 300:  # 5 minutes (reduced from 1 hour)
+                        prompt_id = item.get('prompt', [None, 'unknown'])[1] if isinstance(item.get('prompt'), (list, tuple)) and len(item.get('prompt', [])) > 1 else 'unknown'
+                        username = item.get('username') or item.get('user_id') or 'unknown'
+                        print(f"[Sentinel] AUTO-CLEANUP: Removing stuck item (running {elapsed:.1f}s >5min): item_id={item_id}, prompt_id={prompt_id}, user={username}")
+                        self.__prompt_queue.currently_running.pop(item_id, None)
+                        cleaned_count += 1
+                elif isinstance(item, dict):
+                    # Item doesn't have timestamp - might be from before patch
+                    # Check if it's been in queue too long by checking if it's been there since startup
+                    # For now, just log it
+                    prompt_id = item.get('prompt', [None, 'unknown'])[1] if isinstance(item.get('prompt'), (list, tuple)) and len(item.get('prompt', [])) > 1 else 'unknown'
+                    print(f"[Sentinel] WARNING: Item in queue without timestamp: item_id={item_id}, prompt_id={prompt_id}")
+                    # Add timestamp now to track it
+                    item["_start_time"] = current_time
+            
+            if cleaned_count > 0:
+                print(f"[Sentinel] AUTO-CLEANUP: Removed {cleaned_count} stuck item(s) from queue")
+                self.server.queue_updated()
+                running_count -= cleaned_count
+            
+            return queue_count + running_count
+
     def patch_prompt_queue(self):
         self.__prompt_queue.put = self.user_queue_put
         self.__prompt_queue.get = self.user_queue_get
         self.__prompt_queue.task_done = self.user_queue_task_done
         self.__prompt_queue.get_current_queue = self.user_queue_get_current_queue
         self.__prompt_queue.get_current_queue_volatile = self.user_queue_get_current_queue_volatile
+        self.__prompt_queue.get_tasks_remaining = self.user_queue_get_tasks_remaining
         
         self.__prompt_queue.wipe_queue = self.user_queue_wipe_queue
         self.__prompt_queue.delete_queue_item = self.user_queue_delete_queue_item
         self.__prompt_queue.get_history = self.user_queue_get_history
         self.__prompt_queue.wipe_history = self.user_queue_wipe_history
+        
+        # Patch prompt_worker to ensure task_done is always called
+        # NOTE: We defer this patching to avoid circular import issues during Sentinel initialization
+        # The patching will happen lazily in user_queue_get when the first item is retrieved
+        # This ensures main.py is fully loaded before we try to patch
+        self._prompt_worker_patched = False
+        self._prompt_worker_patch_lock = threading.Lock()
+        print("[Sentinel] DEBUG: prompt_worker patching deferred to avoid circular import (will patch on first queue access)")
         
         # Patch PromptExecutor to set user context before execution
         try:
@@ -1269,8 +1670,41 @@ class AccessControl:
                     execution.PromptExecutor._original_execute_async, 
                     self
                 )
+                
+                # CRITICAL: Patch the execute function to update SaveImage output_dir when nodes are retrieved from cache
+                # This ensures cached node instances get the correct directory even for old workflows
+                if not hasattr(execution, '_original_execute'):
+                    execution._original_execute = execution.execute
+                
+                async def patched_execute(server, dynprompt, caches, current_item, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, ui_outputs):
+                    # CRITICAL: Update output_dir BEFORE execution for SaveImage nodes retrieved from cache
+                    # This ensures cached node instances get the correct directory even for old workflows
+                    unique_id = current_item
+                    class_type = dynprompt.get_node(unique_id)['class_type']
+                    
+                    # If this is a SaveImage or PreviewImage node, update output_dir BEFORE execution
+                    # This is critical because the node instance might be cached from a previous user
+                    if class_type in ('SaveImage', 'PreviewImage'):
+                        obj = caches.objects.get(unique_id)
+                        if obj is not None:
+                            # Update output_dir to current user's directory BEFORE execution
+                            if class_type == 'SaveImage':
+                                old_dir = getattr(obj, 'output_dir', None)
+                                obj.output_dir = folder_paths.get_output_directory()
+                                if old_dir != obj.output_dir:
+                                    username = self.get_current_username() or "unknown"
+                                    print(f"[Sentinel] DEBUG: Updated cached SaveImage output_dir from '{old_dir}' to '{obj.output_dir}' for user={username}")
+                            elif class_type == 'PreviewImage':
+                                obj.output_dir = folder_paths.get_temp_directory()
+                    
+                    # Call original execute function
+                    return await execution._original_execute(server, dynprompt, caches, current_item, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, ui_outputs)
+                
+                execution.execute = patched_execute
         except Exception as e:
             print(f"[Sentinel] WARNING: Could not patch PromptExecutor: {e}")
+            import traceback
+            traceback.print_exc()
         
         # Patch cache key generation to include user context
         self._patch_cache_for_user_isolation()
